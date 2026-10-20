@@ -184,7 +184,7 @@ def get_dxy():
     try:
         data = get_json(f"{BASE_URL}/DXY")
         price = find_number(
-            data, ["price", "last", "close", "value", "bid"]
+            data, data, ["mid", "bid", "ask", "price", "close", "value"]
         )
         change = find_number(
             data, ["changePercent", "change_pct",
