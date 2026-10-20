@@ -187,7 +187,7 @@ def get_dxy():
             data, data, ["mid", "bid", "ask", "price", "close", "value"]
         )
         change = find_number(
-            data, ["changePercent", "change_pct",
+            data, [,["dayDiffPercent", "changePercent", "change_pct",
                    "dailyChange", "percentChange"]
         )
 
