@@ -1,14 +1,21 @@
 
-name: Gold Signal Bot
+name: Gold Telegram Bot
 
-'on':
+on:
   workflow_dispatch:
+  schedule:
+    - cron: "*/15 * * * *"
+
+permissions:
+  contents: read
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+
     steps:
-      - name: Download repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -16,10 +23,10 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install libraries
+      - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run bot
+      - name: Run Gold Bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
