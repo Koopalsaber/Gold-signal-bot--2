@@ -1,812 +1,393 @@
-//+------------------------------------------------------------------+
-//| Ahuramazda EURCHF EA - Prototype v0.2                            |
-//| DEMO TEST ONLY                                                    |
-//+------------------------------------------------------------------+
-#property strict
-#property version "0.20"
+import os
+import requests
+import pandas as pd
+from datetime import datetime, timezone
 
-#include <Trade/Trade.mqh>
-CTrade trade;
+BASE_URL = "https://biquote.io/api"
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+CHAT_ID = os.environ["CHAT_ID"]
+TIMEOUT = 20
 
-input string InpSymbol="EURCHF";
-input bool InpEnableTrading=false;
-input ulong InpMagic=26103101;
+def get_json(url, params=None):
+r = requests.get(url, params=params, timeout=TIMEOUT)
+r.raise_for_status()
+return r.json()
 
-input double InpRiskPercent=0.25;
-input double InpMaxOpenRiskPercent=1.0;
-input double InpDailyLossLimitPercent=2.0;
-input double InpMaxDrawdownPercent=5.0;
-input double InpRewardRisk=2.0;
+def get_candles(interval):
+data = get_json(
+f"{BASE_URL}/XAUUSD/ohlc",
+{"interval": interval, "limit": 180}
+)
 
-input int InpMinScore=65;
-input int InpMaxSpreadPoints=35;
-input int InpSwingWing=3;
+bars = data.get("bars", []) if isinstance(data, dict) else data  
+bars = [b for b in bars if not b.get("isOpen", False)]  
+bars.sort(key=lambda b: b.get("openTime", ""))  
 
-input int InpATRPeriod=14;
-input int InpRSIPeriod=14;
-input int InpADXPeriod=14;
-input int InpFastEMA=20;
-input int InpSlowEMA=50;
+df = pd.DataFrame(bars)  
+if df.empty:  
+    raise ValueError(f"داده کندل {interval} دریافت نشد")  
 
-input bool InpUseH4Context=true;
-input bool InpUseM15Confirmation=true;
-input bool InpRequireHedging=true;
-input bool InpAllowOppositePositions=true;
-input bool InpDiagnostics=true;
+for col in ["open", "high", "low", "close"]:  
+    df[col] = pd.to_numeric(df[col], errors="coerce")  
 
-int hFast1=INVALID_HANDLE;
-int hSlow1=INVALID_HANDLE;
-int hFast4=INVALID_HANDLE;
-int hSlow4=INVALID_HANDLE;
+df = df.dropna(subset=["open", "high", "low", "close"])  
+if len(df) < 60:  
+    raise ValueError(f"داده کافی برای {interval} وجود ندارد")  
 
-int hRSI=INVALID_HANDLE;
-int hADX=INVALID_HANDLE;
-int hATR=INVALID_HANDLE;
-int hMACD=INVALID_HANDLE;
-int hBands=INVALID_HANDLE;
+return df.reset_index(drop=True)
 
-datetime lastBar=0;
-double initialEquity=0;
-double dayStartEquity=0;
+def analyze(interval):
+df = get_candles(interval)
+c, h, l = df["close"], df["high"], df["low"]
 
-int storedDay=-1;
-bool riskHalt=false;
-string gvPrefix="";
-int ScoreRawMax=85;
+ema20 = c.ewm(span=20, adjust=False).mean()  
+ema50 = c.ewm(span=50, adjust=False).mean()  
 
-bool Buf(int h,int b,int shift,double &v)
-{
-   double a[];
-   ArraySetAsSeries(a,true);
+delta = c.diff()  
+gain = delta.clip(lower=0)  
+loss = -delta.clip(upper=0)  
+avg_gain = gain.ewm(  
+    alpha=1 / 14, min_periods=14, adjust=False  
+).mean()  
+avg_loss = loss.ewm(  
+    alpha=1 / 14, min_periods=14, adjust=False  
+).mean()  
+rs = avg_gain / avg_loss.replace(0, float("nan"))  
+rsi = 100 - (100 / (1 + rs))  
 
-   if(h==INVALID_HANDLE ||
-      CopyBuffer(h,b,shift,1,a)!=1)
-      return false;
+prev_close = c.shift(1)  
+tr = pd.concat([  
+    h - l,  
+    (h - prev_close).abs(),  
+    (l - prev_close).abs()  
+], axis=1).max(axis=1)  
+atr = tr.ewm(alpha=1 / 14, adjust=False).mean()  
 
-   v=a[0];
-   return MathIsValidNumber(v);
+plus_dm = h.diff()  
+minus_dm = -l.diff()  
+plus_dm = plus_dm.where(  
+    (plus_dm > minus_dm) & (plus_dm > 0), 0.0  
+)  
+minus_dm = minus_dm.where(  
+    (minus_dm > plus_dm) & (minus_dm > 0), 0.0  
+)  
+
+atr14 = tr.ewm(alpha=1 / 14, adjust=False).mean()  
+plus_di = 100 * plus_dm.ewm(  
+    alpha=1 / 14, adjust=False  
+).mean() / atr14.replace(0, float("nan"))  
+minus_di = 100 * minus_dm.ewm(  
+    alpha=1 / 14, adjust=False  
+).mean() / atr14.replace(0, float("nan"))  
+
+dx = 100 * (plus_di - minus_di).abs() / (  
+    plus_di + minus_di  
+).replace(0, float("nan"))  
+adx = dx.ewm(alpha=1 / 14, adjust=False).mean()  
+
+macd = (  
+    c.ewm(span=12, adjust=False).mean()  
+    - c.ewm(span=26, adjust=False).mean()  
+)  
+macd_signal = macd.ewm(span=9, adjust=False).mean()  
+
+bb_mid = c.rolling(20).mean()  
+bb_std = c.rolling(20).std()  
+bb_upper = bb_mid + 2 * bb_std  
+bb_lower = bb_mid - 2 * bb_std  
+
+i = len(df) - 1  
+
+def val(series):  
+    x = series.iloc[i]  
+    return float(x) if pd.notna(x) else 0.0  
+
+return {  
+    "price": val(c),  
+    "ema20": val(ema20),  
+    "ema50": val(ema50),  
+    "rsi": val(rsi),  
+    "atr": val(atr),  
+    "macd": val(macd),  
+    "macd_signal": val(macd_signal),  
+    "adx": val(adx),  
+    "plus_di": val(plus_di),  
+    "minus_di": val(minus_di),  
+    "bb_upper": val(bb_upper),  
+    "bb_mid": val(bb_mid),  
+    "bb_lower": val(bb_lower),  
+    "support": float(l.tail(20).min()),  
+    "resistance": float(h.tail(20).max()),  
 }
 
-bool Rates(ENUM_TIMEFRAMES tf,int n,MqlRates &r[])
-{
-   ArraySetAsSeries(r,true);
-   return CopyRates(InpSymbol,tf,0,n,r)==n;
-}
-
-double NPrice(double p)
-{
-   return NormalizeDouble(
-      p,
-      (int)SymbolInfoInteger(InpSymbol,SYMBOL_DIGITS)
-   );
-}
-
-bool NewH1Bar()
-{
-   datetime t=iTime(InpSymbol,PERIOD_H1,0);
-
-   if(t<=0) return false;
-
-   if(t!=lastBar)
-   {
-      lastBar=t;
-      return true;
-   }
-
-   return false;
-}int DateKey()
-{
-   MqlDateTime d;
-   TimeToStruct(TimeCurrent(),d);
-   return d.year*10000+d.mon*100+d.day;
-}
-
-void UpdateDay()
-{
-   int key=DateKey();
-   double eq=AccountInfoDouble(ACCOUNT_EQUITY);
-
-   if(key!=storedDay)
-   {
-      storedDay=key;
-      dayStartEquity=eq;
-
-      GlobalVariableSet(gvPrefix+"_DAY",(double)storedDay);
-      GlobalVariableSet(gvPrefix+"_DAYEQ",dayStartEquity);
-      GlobalVariableSet(gvPrefix+"_DAYHALT",0.0);
-
-      Print("Ahuramazda: new daily baseline ",dayStartEquity);
-   }
-}
-
-bool Halted()
-{
-   UpdateDay();
-
-   double eq=AccountInfoDouble(ACCOUNT_EQUITY);
-
-   double dl=dayStartEquity>0 ?
-      (dayStartEquity-eq)/dayStartEquity*100.0 : 0.0;
-
-   double dd=initialEquity>0 ?
-      (initialEquity-eq)/initialEquity*100.0 : 0.0;
-
-   if(dl>=InpDailyLossLimitPercent)
-      GlobalVariableSet(gvPrefix+"_DAYHALT",1.0);
-
-   if(dd>=InpMaxDrawdownPercent)
-      GlobalVariableSet(gvPrefix+"_MAXHALT",1.0);
-
-   bool dayLocked=
-      GlobalVariableCheck(gvPrefix+"_DAYHALT") &&
-      GlobalVariableGet(gvPrefix+"_DAYHALT")>0.5;
-
-   bool maxLocked=
-      GlobalVariableCheck(gvPrefix+"_MAXHALT") &&
-      GlobalVariableGet(gvPrefix+"_MAXHALT")>0.5;
-
-   riskHalt=dayLocked || maxLocked;
-
-   return riskHalt;
-}
-
-bool Hedging()
-{
-   return (ENUM_ACCOUNT_MARGIN_MODE)
-      AccountInfoInteger(ACCOUNT_MARGIN_MODE)
-      ==ACCOUNT_MARGIN_MODE_RETAIL_HEDGING;
-}
-
-bool SpreadOK()
-{
-   MqlTick t;
-
-   if(!SymbolInfoTick(InpSymbol,t))
-      return false;
-
-   double pt=SymbolInfoDouble(InpSymbol,SYMBOL_POINT);
-
-   if(pt<=0) return false;
-
-   return ((t.ask-t.bid)/pt<=InpMaxSpreadPoints);
-}
-
-bool H4Direction(int &dir)
-{
-   dir=0;
-
-   double f,s;
-
-   if(!Buf(hFast4,0,1,f) ||
-      !Buf(hSlow4,0,1,s))
-      return false;
-
-   if(f>s) dir=1;
-   else if(f<s) dir=-1;
-
-   return true;
-}
-
-bool M15Confirm(int dir)
-{
-   if(!InpUseM15Confirmation)
-      return true;
-
-   MqlRates r[];
-
-   if(!Rates(PERIOD_M15,3,r))
-      return false;
-
-   return dir>0 ?
-      r[1].close>r[1].open :
-      r[1].close<r[1].open;
-}
-
-bool Engulfing(int dir)
-{
-   MqlRates r[];
-
-   if(!Rates(PERIOD_H1,3,r))
-      return false;
-
-   double ph=MathMax(r[2].open,r[2].close);
-   double pl=MathMin(r[2].open,r[2].close);
-
-   double ch=MathMax(r[1].open,r[1].close);
-   double cl=MathMin(r[1].open,r[1].close);
-
-   if(dir>0)
-      return r[2].close<r[2].open &&
-             r[1].close>r[1].open &&
-             ch>=ph && cl<=pl;
-
-   return r[2].close>r[2].open &&
-          r[1].close<r[1].open &&
-          ch>=ph && cl<=pl;
-}
-
-bool RecentSwing(bool buy,double &level)
-{
-   MqlRates r[];
-
-   int n=100;
-   int wing=MathMax(2,InpSwingWing);
-
-   if(!Rates(PERIOD_H1,n,r))
-      return false;
-
-   for(int i=wing+1;i<n-wing;i++)
-   {
-      bool ok=true;
-      double x=buy?r[i].low:r[i].high;
-
-      for(int j=1;j<=wing;j++)
-      {
-         if(buy && (r[i-j].low<=x || r[i+j].low<x))
-         {
-            ok=false;
-            break;
-         }
-
-         if(!buy && (r[i-j].high>=x || r[i+j].high>x))
-         {
-            ok=false;
-            break;
-         }
-      }
-
-      if(ok)
-      {
-         level=x;
-         return true;
-      }
-   }
-
-   return false;
-}int DateKey()
-{
-   MqlDateTime d;
-   TimeToStruct(TimeCurrent(),d);
-   return d.year*10000+d.mon*100+d.day;
-}
-
-void UpdateDay()
-{
-   int key=DateKey();
-   double eq=AccountInfoDouble(ACCOUNT_EQUITY);
-
-   if(key!=storedDay)
-   {
-      storedDay=key;
-      dayStartEquity=eq;
-
-      GlobalVariableSet(gvPrefix+"_DAY",(double)storedDay);
-      GlobalVariableSet(gvPrefix+"_DAYEQ",dayStartEquity);
-      GlobalVariableSet(gvPrefix+"_DAYHALT",0.0);
-
-      Print("Ahuramazda: new daily baseline ",dayStartEquity);
-   }
-}
-
-bool Halted()
-{
-   UpdateDay();
-
-   double eq=AccountInfoDouble(ACCOUNT_EQUITY);
-
-   double dl=dayStartEquity>0 ?
-      (dayStartEquity-eq)/dayStartEquity*100.0 : 0.0;
-
-   double dd=initialEquity>0 ?
-      (initialEquity-eq)/initialEquity*100.0 : 0.0;
-
-   if(dl>=InpDailyLossLimitPercent)
-      GlobalVariableSet(gvPrefix+"_DAYHALT",1.0);
-
-   if(dd>=InpMaxDrawdownPercent)
-      GlobalVariableSet(gvPrefix+"_MAXHALT",1.0);
-
-   bool dayLocked=
-      GlobalVariableCheck(gvPrefix+"_DAYHALT") &&
-      GlobalVariableGet(gvPrefix+"_DAYHALT")>0.5;
-
-   bool maxLocked=
-      GlobalVariableCheck(gvPrefix+"_MAXHALT") &&
-      GlobalVariableGet(gvPrefix+"_MAXHALT")>0.5;
-
-   riskHalt=dayLocked || maxLocked;
-
-   return riskHalt;
-}
-
-bool Hedging()
-{
-   return (ENUM_ACCOUNT_MARGIN_MODE)
-      AccountInfoInteger(ACCOUNT_MARGIN_MODE)
-      ==ACCOUNT_MARGIN_MODE_RETAIL_HEDGING;
-}
-
-bool SpreadOK()
-{
-   MqlTick t;
-
-   if(!SymbolInfoTick(InpSymbol,t))
-      return false;
-
-   double pt=SymbolInfoDouble(InpSymbol,SYMBOL_POINT);
-
-   if(pt<=0) return false;
-
-   return ((t.ask-t.bid)/pt<=InpMaxSpreadPoints);
-}
-
-bool H4Direction(int &dir)
-{
-   dir=0;
-
-   double f,s;
-
-   if(!Buf(hFast4,0,1,f) ||
-      !Buf(hSlow4,0,1,s))
-      return false;
-
-   if(f>s) dir=1;
-   else if(f<s) dir=-1;
-
-   return true;
-}
-
-bool M15Confirm(int dir)
-{
-   if(!InpUseM15Confirmation)
-      return true;
-
-   MqlRates r[];
-
-   if(!Rates(PERIOD_M15,3,r))
-      return false;
-
-   return dir>0 ?
-      r[1].close>r[1].open :
-      r[1].close<r[1].open;
-}
-
-bool Engulfing(int dir)
-{
-   MqlRates r[];
-
-   if(!Rates(PERIOD_H1,3,r))
-      return false;
-
-   double ph=MathMax(r[2].open,r[2].close);
-   double pl=MathMin(r[2].open,r[2].close);
-
-   double ch=MathMax(r[1].open,r[1].close);
-   double cl=MathMin(r[1].open,r[1].close);
-
-   if(dir>0)
-      return r[2].close<r[2].open &&
-             r[1].close>r[1].open &&
-             ch>=ph && cl<=pl;
-
-   return r[2].close>r[2].open &&
-          r[1].close<r[1].open &&
-          ch>=ph && cl<=pl;
-}
-
-bool RecentSwing(bool buy,double &level)
-{
-   MqlRates r[];
-
-   int n=100;
-   int wing=MathMax(2,InpSwingWing);
-
-   if(!Rates(PERIOD_H1,n,r))
-      return false;
-
-   for(int i=wing+1;i<n-wing;i++)
-   {
-      bool ok=true;
-      double x=buy?r[i].low:r[i].high;
-
-      for(int j=1;j<=wing;j++)
-      {
-         if(buy && (r[i-j].low<=x || r[i+j].low<x))
-         {
-            ok=false;
-            break;
-         }
-
-         if(!buy && (r[i-j].high>=x || r[i+j].high>x))
-         {
-            ok=false;
-            break;
-         }
-      }
-
-      if(ok)
-      {
-         level=x;
-         return true;
-      }
-   }
-
-   return false;
-}int Score(int dir)
-{
-   double ef,es,rsi,adx,pdi,mdi,atr;
-   double macd,sig,up,mid,lo;
-
-   if(!Buf(hFast1,0,1,ef) ||
-      !Buf(hSlow1,0,1,es) ||
-      !Buf(hRSI,0,1,rsi) ||
-      !Buf(hADX,0,1,adx) ||
-      !Buf(hADX,1,1,pdi) ||
-      !Buf(hADX,2,1,mdi) ||
-      !Buf(hATR,0,1,atr) ||
-      !Buf(hMACD,0,1,macd) ||
-      !Buf(hMACD,1,1,sig) ||
-      !Buf(hBands,1,1,up) ||
-      !Buf(hBands,0,1,mid) ||
-      !Buf(hBands,2,1,lo))
-      return 0;
-
-   MqlRates r[];
-   if(!Rates(PERIOD_H1,5,r)) return 0;
-
-   double c=r[1].close;
-   int s=0;
-
-   if(dir>0 && ef>es) s+=6;
-   if(dir<0 && ef<es) s+=6;
-   if(dir>0 && c>ef) s+=4;
-   if(dir<0 && c<ef) s+=4;
-
-   if(dir>0 && rsi>50) s+=6;
-   if(dir<0 && rsi<50) s+=6;
-   if(dir>0 && rsi>55) s+=4;
-   if(dir<0 && rsi<45) s+=4;
-
-   if(adx>=18) s+=4;
-   if(dir>0 && pdi>mdi) s+=6;
-   if(dir<0 && mdi>pdi) s+=6;
-
-   if(dir>0 && macd>sig) s+=5;
-   if(dir<0 && macd<sig) s+=5;
-
-   if(dir>0 && c>mid) s+=3;
-   if(dir<0 && c<mid) s+=3;
-
-   if(up>lo && atr>0) s+=2;
-
-   if(Engulfing(dir)) s+=15;
-
-   double sw=0;
-
-   if(RecentSwing(dir>0,sw))
-   {
-      if(MathAbs(c-sw)<=atr*1.5)
-         s+=10;
-
-      if(dir>0 && c>sw && c>r[2].high)
-         s+=10;
-
-      if(dir<0 && c<sw && c<r[2].low)
-         s+=10;
-   }
-
-   int hd=0;
-
-   if(InpUseH4Context &&
-      H4Direction(hd) && hd==dir)
-      s+=5;
-
-   if(M15Confirm(dir))
-      s+=5;
-
-   return (int)MathRound((double)s*100.0/85.0);
-}
-
-// محاسبه حجم بر اساس ریسک واقعی حد ضرر
-double VolumeForRisk(ENUM_ORDER_TYPE type,double entry,double sl)
-{
-   double budget=
-      AccountInfoDouble(ACCOUNT_EQUITY)*
-      InpRiskPercent/100.0;
-
-   double pl=0;
-
-   if(!OrderCalcProfit(type,InpSymbol,1.0,entry,sl,pl))
-      return 0;
-
-   double loss=MathAbs(pl);
-   if(loss<=0) return 0;
-
-   double raw=budget/loss;
-
-   double step=SymbolInfoDouble(InpSymbol,SYMBOL_VOLUME_STEP);
-   double vmin=SymbolInfoDouble(InpSymbol,SYMBOL_VOLUME_MIN);
-   double vmax=SymbolInfoDouble(InpSymbol,SYMBOL_VOLUME_MAX);
-
-   if(step<=0) return 0;
-
-   double v=MathFloor(raw/step)*step;
-   v=NormalizeDouble(v,2);
-
-   if(v<vmin)
-      return 0;
-
-   return MathMin(v,vmax);
-}
-
-// محاسبه ریسک معاملات باز همین نماد و مجیک
-double CurrentOpenRisk()
-{
-   double total=0;
-
-   for(int i=PositionsTotal()-1;i>=0;i--)
-   {
-      if(!PositionGetTicket(i)) continue;
-
-      if(PositionGetString(POSITION_SYMBOL)!=InpSymbol ||
-         (ulong)PositionGetInteger(POSITION_MAGIC)!=InpMagic)
-         continue;
-
-      double sl=PositionGetDouble(POSITION_SL);
-      double vol=PositionGetDouble(POSITION_VOLUME);
-      double open=PositionGetDouble(POSITION_PRICE_OPEN);
-
-      if(sl<=0) return DBL_MAX;
-
-      ENUM_POSITION_TYPE p=
-         (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-
-      ENUM_ORDER_TYPE ot=
-         p==POSITION_TYPE_BUY ?
-         ORDER_TYPE_BUY : ORDER_TYPE_SELL;
-
-      double pl=0;
-
-      if(!OrderCalcProfit(ot,InpSymbol,vol,open,sl,pl))
-         return DBL_MAX;
-
-      total+=MathAbs(pl);
-   }
-
-   return total;
-}
-
-bool SameDirectionExists(int dir)
-{
-   for(int i=PositionsTotal()-1;i>=0;i--)
-   {
-      if(!PositionGetTicket(i)) continue;
-
-      if(PositionGetString(POSITION_SYMBOL)!=InpSymbol ||
-         (ulong)PositionGetInteger(POSITION_MAGIC)!=InpMagic)
-         continue;
-
-      ENUM_POSITION_TYPE p=
-         (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-
-      if((dir>0 && p==POSITION_TYPE_BUY) ||
-         (dir<0 && p==POSITION_TYPE_SELL))
-         return true;
-   }
-
-   return false;
-}
-
-bool OppositePositionExists(int dir)
-{
-   for(int i=PositionsTotal()-1;i>=0;i--)
-   {
-      if(!PositionGetTicket(i)) continue;
-
-      if(PositionGetString(POSITION_SYMBOL)!=InpSymbol ||
-         (ulong)PositionGetInteger(POSITION_MAGIC)!=InpMagic)
-         continue;
-
-      ENUM_POSITION_TYPE p=
-         (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-
-      if((dir>0 && p==POSITION_TYPE_SELL) ||
-         (dir<0 && p==POSITION_TYPE_BUY))
-         return true;
-   }
-
-   return false;
-}
-
-// ارسال سفارش
-bool SendEntry(int dir)
-{
-   if(!InpEnableTrading || Halted() || !SpreadOK())
-      return false;
-
-   if(InpRequireHedging && !Hedging())
-   {
-      Print("Rejected: account is not Hedging mode");
-      return false;
-   }
-
-   if(SameDirectionExists(dir))
-      return false;
-
-   if(!InpAllowOppositePositions &&
-      OppositePositionExists(dir))
-      return false;
-
-   MqlTick t;
-
-   if(!SymbolInfoTick(InpSymbol,t))
-      return false;
-
-   double atr=0,sw=0;
-
-   if(!Buf(hATR,0,1,atr) ||
-      atr<=0 ||
-      !RecentSwing(dir>0,sw))
-      return false;
-
-   double entry=dir>0?t.ask:t.bid;
-
-   double sl=dir>0 ?
-      NPrice(sw-atr*0.25) :
-      NPrice(sw+atr*0.25);
-
-   if((dir>0 && sl>=entry) ||
-      (dir<0 && sl<=entry))
-      return false;
-
-   double tp=NPrice(
-      dir>0 ?
-      entry+(entry-sl)*InpRewardRisk :
-      entry-(sl-entry)*InpRewardRisk
-   );
-
-   double volume=VolumeForRisk(
-      dir>0?ORDER_TYPE_BUY:ORDER_TYPE_SELL,
-      entry,sl
-   );
-
-   if(volume<=0)
-   {
-      Print("Rejected: invalid volume");
-      return false;
-   }
-
-   double risk=0;
-
-   if(!OrderCalcProfit(
-      dir>0?ORDER_TYPE_BUY:ORDER_TYPE_SELL,
-      InpSymbol,volume,entry,sl,risk))
-      return false;
-
-   double maxRisk=
-      AccountInfoDouble(ACCOUNT_EQUITY)*
-      InpMaxOpenRiskPercent/100.0;
-
-   if(CurrentOpenRisk()+MathAbs(risk)>maxRisk)
-   {
-      Print("Rejected: maximum open risk reached");
-      return false;
-   }
-
-   trade.SetExpertMagicNumber(InpMagic);
-   trade.SetDeviationInPoints(20);
-
-   bool sent=false;
-
-   if(dir>0)
-      sent=trade.Buy(volume,InpSymbol,0,sl,tp,"Ahuramazda BUY");
-   else
-      sent=trade.Sell(volume,InpSymbol,0,sl,tp,"Ahuramazda SELL");
-
-   Print("Order result: ",sent,
-         " | Retcode: ",trade.ResultRetcode(),
-         " | ",trade.ResultRetcodeDescription());
-
-   return sent;
-}
-
-// ارزیابی سیگنال
-void Evaluate()
-{
-   if(Halted())
-      return;
-
-   int buy=Score(1);
-   int sell=Score(-1);
-
-   if(InpDiagnostics)
-      Print("Ahuramazda scores | BUY=",buy,
-            " SELL=",sell);
-
-   if(buy>=InpMinScore && buy>sell)
-      SendEntry(1);
-
-   else if(sell>=InpMinScore && sell>buy)
-      SendEntry(-1);
-}
-
-// راه‌اندازی
-int OnInit()
-{
-   if(!SymbolSelect(InpSymbol,true))
-      return INIT_FAILED;
-
-   gvPrefix="AHURA_"+IntegerToString((long)AccountInfoInteger(ACCOUNT_LOGIN))
-            +"_"+InpSymbol+"_"+IntegerToString((long)InpMagic);
-
-   if(GlobalVariableCheck(gvPrefix+"_INITIAL"))
-      initialEquity=GlobalVariableGet(gvPrefix+"_INITIAL");
-   else
-   {
-      initialEquity=AccountInfoDouble(ACCOUNT_EQUITY);
-      GlobalVariableSet(gvPrefix+"_INITIAL",initialEquity);
-   }
-
-   if(GlobalVariableCheck(gvPrefix+"_DAY"))
-      storedDay=(int)GlobalVariableGet(gvPrefix+"_DAY");
-
-   if(GlobalVariableCheck(gvPrefix+"_DAYEQ"))
-      dayStartEquity=GlobalVariableGet(gvPrefix+"_DAYEQ");
-
-   hFast1=iMA(InpSymbol,PERIOD_H1,InpFastEMA,0,MODE_EMA,PRICE_CLOSE);
-   hSlow1=iMA(InpSymbol,PERIOD_H1,InpSlowEMA,0,MODE_EMA,PRICE_CLOSE);
-
-   hFast4=iMA(InpSymbol,PERIOD_H4,InpFastEMA,0,MODE_EMA,PRICE_CLOSE);
-   hSlow4=iMA(InpSymbol,PERIOD_H4,InpSlowEMA,0,MODE_EMA,PRICE_CLOSE);
-
-   hRSI=iRSI(InpSymbol,PERIOD_H1,InpRSIPeriod,PRICE_CLOSE);
-   hADX=iADX(InpSymbol,PERIOD_H1,InpADXPeriod);
-   hATR=iATR(InpSymbol,PERIOD_H1,InpATRPeriod);
-   hMACD=iMACD(InpSymbol,PERIOD_H1,12,26,9,PRICE_CLOSE);
-   hBands=iBands(InpSymbol,PERIOD_H1,20,0,2.0,PRICE_CLOSE);
-
-   if(hFast1==INVALID_HANDLE ||
-      hSlow1==INVALID_HANDLE ||
-      hFast4==INVALID_HANDLE ||
-      hSlow4==INVALID_HANDLE ||
-      hRSI==INVALID_HANDLE ||
-      hADX==INVALID_HANDLE ||
-      hATR==INVALID_HANDLE ||
-      hMACD==INVALID_HANDLE ||
-      hBands==INVALID_HANDLE)
-      return INIT_FAILED;
-
-   trade.SetExpertMagicNumber(InpMagic);
-
-   Print("Ahuramazda v0.20 initialized. Trading enabled: ",
-         InpEnableTrading);
-
-   return INIT_SUCCEEDED;
-}
-
-// پایان کار
-void OnDeinit(const int reason)
-{
-   IndicatorRelease(hFast1);
-   IndicatorRelease(hSlow1);
-   IndicatorRelease(hFast4);
-   IndicatorRelease(hSlow4);
-   IndicatorRelease(hRSI);
-   IndicatorRelease(hADX);
-   IndicatorRelease(hATR);
-   IndicatorRelease(hMACD);
-   IndicatorRelease(hBands);
-}
-
-// اجرای اصلی
-void OnTick()
-{
-   if(_Symbol!=InpSymbol)
-      return;
-
-   Halted();
-
-   if(NewH1Bar())
-      Evaluate();
-}
-//+------------------------------------------------------------------+
+def get_dxy():
+try:
+data = get_json(f"{BASE_URL}/DXY")
+
+if not isinstance(data, dict):  
+        return None, None, "پاسخ نامعتبر"  
+
+    # mid اولویت دارد؛ last در این API ممکن است صفر باشد.  
+    price = None  
+    for key in ["mid", "bid", "ask", "price", "close", "value"]:  
+        try:  
+            v = float(data.get(key))  
+            if v > 0:  
+                price = v  
+                break  
+        except (TypeError, ValueError):  
+            continue  
+
+    change = None  
+    for key in [  
+        "dayDiffPercent", "changePercent",  
+        "change_pct", "dailyChange", "percentChange"  
+    ]:  
+        try:  
+            if data.get(key) is not None:  
+                change = float(data[key])  
+                break  
+        except (TypeError, ValueError):  
+            continue  
+
+    stale = data.get("stale", False)  
+    status = "داده قدیمی است" if stale else "دریافت شد"  
+    return price, change, status  
+
+except Exception as e:  
+    return None, None, f"خطا: {str(e)[:100]}"
+
+def get_yield(series_id):
+url = (
+"https://fred.stlouisfed.org/graph/fredgraph.csv"
+f"?id={series_id}"
+)
+try:
+df = pd.read_csv(url)
+if len(df.columns) < 2:
+return None, None, None
+
+date_col, value_col = df.columns[0], df.columns[1]  
+    df[value_col] = pd.to_numeric(  
+        df[value_col], errors="coerce"  
+    )  
+    df = df.dropna(subset=[value_col])  
+
+    if len(df) < 1:  
+        return None, None, None  
+
+    latest = float(df[value_col].iloc[-1])  
+    date = str(df[date_col].iloc[-1])  
+    change = None  
+
+    if len(df) >= 2:  
+        change = latest - float(df[value_col].iloc[-2])  
+
+    return latest, change, date  
+
+except Exception:  
+    return None, None, None
+
+def get_calendar():
+urls = [
+"https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+f"{BASE_URL}/calendar"
+]
+
+for url in urls:  
+    try:  
+        data = get_json(url)  
+        if isinstance(data, dict):  
+            data = data.get("events", data.get("data", []))  
+        if isinstance(data, list):  
+            events = []  
+            for e in data:  
+                if not isinstance(e, dict):  
+                    continue  
+                currency = str(  
+                    e.get("country", e.get("currency", ""))  
+                ).upper()  
+                if currency not in ["USD", "US"]:  
+                    continue  
+
+                impact = str(e.get("impact", "")).lower()  
+                title = (  
+                    e.get("title")  
+                    or e.get("event")  
+                    or e.get("name")  
+                    or "خبر USD"  
+                )  
+                when = (  
+                    e.get("date")  
+                    or e.get("datetime")  
+                    or e.get("time")  
+                    or "زمان نامشخص"  
+                )  
+                events.append((str(impact), str(title), str(when)))  
+
+            return events[:8], "دریافت شد"  
+    except Exception:  
+        continue  
+
+return [], "در دسترس نیست"
+
+def send_telegram(message):
+url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+r = requests.post(
+url,
+json={
+"chat_id": CHAT_ID,
+"text": message[:4000],
+"disable_web_page_preview": True
+},
+timeout=TIMEOUT
+)
+if not r.ok:
+raise RuntimeError(
+f"Telegram error {r.status_code}: {r.text[:300]}"
+)
+
+def trend(x):
+if x["ema20"] > x["ema50"]:
+return "صعودی"
+if x["ema20"] < x["ema50"]:
+return "نزولی"
+return "خنثی"
+
+def main():
+m15 = analyze("15m")
+h1 = analyze("1h")
+h4 = analyze("4h")
+
+# رأی تکنیکال در تایم‌فریم 15 دقیقه  
+buy_score = 0  
+sell_score = 0  
+
+for x in [m15, h1, h4]:  
+    if x["ema20"] > x["ema50"]:  
+        buy_score += 1  
+    elif x["ema20"] < x["ema50"]:  
+        sell_score += 1  
+
+if m15["macd"] > m15["macd_signal"]:  
+    buy_score += 1  
+elif m15["macd"] < m15["macd_signal"]:  
+    sell_score += 1  
+
+if m15["plus_di"] > m15["minus_di"]:  
+    buy_score += 1  
+elif m15["plus_di"] < m15["minus_di"]:  
+    sell_score += 1  
+
+rsi = m15["rsi"]  
+if 50 <= rsi < 70:  
+    buy_score += 1  
+elif 30 < rsi < 50:  
+    sell_score += 1  
+
+entry = m15["price"]  
+atr = m15["atr"]  
+
+if buy_score >= 4 and buy_score > sell_score and rsi < 70:  
+    direction = "خرید"  
+    sl = entry - 1.5 * atr  
+    tp1 = entry + 2 * atr  
+    tp2 = entry + 3 * atr  
+elif sell_score >= 4 and sell_score > buy_score and rsi > 30:  
+    direction = "فروش"  
+    sl = entry + 1.5 * atr  
+    tp1 = entry - 2 * atr  
+    tp2 = entry - 3 * atr  
+else:  
+    direction = "بدون سیگنال قطعی"  
+    sl = tp1 = tp2 = None  
+
+dxy, dxy_change, dxy_status = get_dxy()  
+y2, y2_change, y2_date = get_yield("DGS2")  
+y10, y10_change, y10_date = get_yield("DGS10")  
+events, calendar_status = get_calendar()  
+
+now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")  
+
+lines = [  
+    "تحلیل ربات طلای XAUUSD",  
+    f"زمان گزارش: {now}",  
+    f"قیمت آخرین کندل بسته‌شده: {entry:.2f}",  
+    "",  
+    "روند تایم‌فریم‌ها:",  
+    f"15m: {trend(m15)} | 1h: {trend(h1)} | 4h: {trend(h4)}",  
+    "",  
+    "اندیکاتورهای 15m:",  
+    f"MA20: {m15['ema20']:.2f} | MA50: {m15['ema50']:.2f}",  
+    f"RSI: {m15['rsi']:.1f} | ADX: {m15['adx']:.1f}",  
+    f"+DI: {m15['plus_di']:.1f} | -DI: {m15['minus_di']:.1f}",  
+    f"ATR: {m15['atr']:.2f}",  
+    f"MACD: {m15['macd']:.3f} | سیگنال MACD: {m15['macd_signal']:.3f}",  
+    f"Bollinger بالا: {m15['bb_upper']:.2f}",  
+    f"Bollinger میانی: {m15['bb_mid']:.2f}",  
+    f"Bollinger پایین: {m15['bb_lower']:.2f}",  
+    "",  
+    f"حمایت تقریبی: {m15['support']:.2f}",  
+    f"مقاومت تقریبی: {m15['resistance']:.2f}",  
+    "",  
+    "داده‌های کلان:"  
+]  
+
+lines.append(  
+    f"DXY: {dxy:.3f}" if dxy is not None  
+    else "DXY: دریافت نشد"  
+)  
+if dxy_change is not None:  
+    lines.append(f"تغییر روزانه DXY: {dxy_change:+.4f}%")  
+lines.append(f"وضعیت DXY: {dxy_status}")  
+
+lines.append(  
+    f"اوراق 2 ساله آمریکا: {y2:.3f}%"  
+    + (f" | تغییر: {y2_change:+.3f} واحد درصد" if y2_change is not None else "")  
+    + (f" | تاریخ داده: {y2_date}" if y2_date else "")  
+    if y2 is not None else "اوراق 2 ساله آمریکا: دریافت نشد"  
+)  
+lines.append(  
+    f"اوراق 10 ساله آمریکا: {y10:.3f}%"  
+    + (f" | تغییر: {y10_change:+.3f} واحد درصد" if y10_change is not None else "")  
+    + (f" | تاریخ داده: {y10_date}" if y10_date else "")  
+    if y10 is not None else "اوراق 10 ساله آمریکا: دریافت نشد"  
+)  
+
+lines.extend(["", f"وضعیت تقویم خبری: {calendar_status}"])  
+if events:  
+    lines.append("اخبار USD:")  
+    for impact, title, when in events[:5]:  
+        lines.append(f"- {title} | اثر: {impact} | زمان: {when}")  
+else:  
+    lines.append("اخبار USD: در این اجرا دریافت نشد")  
+
+lines.extend([  
+    "",  
+    f"نتیجه: {direction}",  
+    f"رأی تکنیکال خرید/فروش: {buy_score}/{sell_score}"  
+])  
+
+if sl is not None:  
+    lines.extend([  
+        f"ورود مرجع: {entry:.2f}",  
+        f"حد ضرر (SL): {sl:.2f}",  
+        f"هدف اول (TP1): {tp1:.2f}",  
+        f"هدف دوم (TP2): {tp2:.2f}"  
+    ])  
+
+lines.extend([  
+    "",  
+    "هشدار: این گزارش آزمایشی است و سود را تضمین نمی‌کند.",  
+    "اوراق FRED روزانه‌اند و ممکن است با زمان گزارش هم‌زمان نباشند."  
+])  
+
+send_telegram("\n".join(lines))
+
+if name == "main":
+try:
+main()
+except Exception as e:
+# خطای اجرا را هم در Actions ثبت می‌کند.
+print(f"ERROR: {type(e).name}: {e}")
+raise
